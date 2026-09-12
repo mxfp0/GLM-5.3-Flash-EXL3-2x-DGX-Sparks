@@ -96,9 +96,11 @@ as below; the stock k=7 / BF16 serve measured ~18–27 tok/s per stream on the l
 | **×1** | **268 ms** | **32.1** | **32.1** |
 | **×2** | 399 ms | 22.1 | 41.2 |
 
-### Faster prose decode (opt-in, 2026-09-08)
+### Faster prose decode (adaptive-k default on; dense FP8 opt-in)
 
-Two decode speed-ups ship in the overlay, both **off by default** (matched A/B/A at 131k and 850k, 8 runs per prompt, bootstrap 95 % CI; receipts in `logs/overnight-decode-20260907T224521Z/`):
+Two decode speed-ups ship in the overlay. Adaptive-k is enabled for new installs
+in `.env.example`; dense FP8 remains opt-in because it changes target numerics.
+Earlier matched A/B/A receipts are in `logs/overnight-decode-20260907T224521Z/`.
 
 - **Adaptive verification length** (`GLM53_ADAPTIVE_K=ema`): the DFlash2 drafter still proposes 7 tokens, but the scheduler verifies only a per-step prefix (2, 4 or 7) chosen from a running average of how many drafts have been surviving, batch-uniform so every decode step keeps its FULL CUDA graph. Lossless at temperature 0. Measured vs stock k=7 (8 runs/prompt, 131k and 850k): Silk Road essay +21 %, sky/sunset +13 %, hash-map +10 %, code +5–15 %, counting unchanged.
 - **FP8 weight-only dense projections** (`GLM53_DENSE_FP8=dense,kda`): KDA and dense-MLP projections quantised per output channel to FP8 at load and run through the Marlin kernel, ~11 ms less per step on everything (+10 % on counting, prose +12–19 % alone, **+37 % on hard prose stacked with adaptive-k**). PROVISIONAL: it changes target numerics by FP8 rounding (KL proxy vs stock 0.002–0.013 nats/position, argmax agreement 94–100 %; no full KLD panel yet).
