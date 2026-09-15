@@ -30,12 +30,21 @@ ip() { printf 'inet %s/24\n' "$HEAD_IP"; }
 nvidia-smi() { printf 'GPU 0: GB10\n'; }
 hostname() { printf 'fake-head\n'; }
 check_port_free() { return 0; }
+# Memory validation has its own tests; keep this NIC fixture independent of
+# the host's available memory and avoid reading its /proc/meminfo.
+read_meminfo_kib() {
+    if [ "$1" = /dev/stdin ]; then command cat >/dev/null; fi
+    printf '134217728 125829120\n'
+}
+preflight_memory() { return 0; }
 df() { printf 'Filesystem 1024-blocks Used Available Capacity Mounted\nfake 999999999 0 999999999 0%% /\n'; }
 cat() {
     # Never fall through to real sysfs (or any other host file).
     case "$1" in
         /sys/class/infiniband/*)
             command cat "$FAKE_SYSFS/$FAKE_NODE/${1#/sys/class/infiniband/}" ;;
+        /proc/meminfo)
+            printf 'MemTotal: 134217728 kB\nMemAvailable: 125829120 kB\n' ;;
         *) printf 'unexpected cat: %s\n' "$*" >&2; return 1 ;;
     esac
 }
@@ -89,14 +98,16 @@ def run_preflight(tmp_path, head_count=2, worker_count=2, broken=None):
         "WORKER_CX7_IB": ",".join(HCAS["worker"][:worker_count]),
         "HEAD_GID": GIDS["head"], "WORKER_GID": GIDS["worker"],
         "TP": "2", "NNODES": "2", "CONTAINER_WORKER": "fake-worker",
+        "GPU_MEM_UTIL": "0.85",
         "PORT": "8888", "MASTER_PORT": "29521", "SCRIPT_DIR": str(tmp_path),
         "ABLIT": "0", "HF_CACHE_DIR": str(tmp_path / "head-cache"),
         "WORKER_HOME": str(tmp_path), "WORKER_CACHE_DIR": str(tmp_path / "worker-cache"),
     }
     for key in ("STOP_PATCH_HOST", "SCHED_PATCH_HOST", "DRAFTER_PATCH_HOST",
-                "APC_PATCH_HOST", "PERGROUP_PATCH_HOST", "XGRAMMAR_PATCH_HOST",
+                "APC_PATCH_HOST", "PERGROUP_PATCH_HOST", "NOSTORE_PATCH_HOST",
+                "KVCAP_PATCH_HOST", "XGRAMMAR_PATCH_HOST", "CACHE_RESET_PATCH_HOST",
                 "KPOOL_TAIL_PATCH_HOST", "SPINWAIT_PATCH_HOST", "ADAPTIVE_K_PATCH_HOST",
-                "DENSE_FP8_PATCH_HOST", "EXL3_OVERLAY_HOST"):
+                "DENSE_FP8_PATCH_HOST", "DEFAULT_TOKENS_PATCH_HOST", "EXL3_OVERLAY_HOST"):
         env[key] = str(placeholder)
     return subprocess.run(
         ["bash", "-c", STUBS + source[begin:end] + "\npreflight\n"],

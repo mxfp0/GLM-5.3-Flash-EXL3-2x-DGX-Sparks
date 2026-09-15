@@ -41,12 +41,13 @@ def test_api_key_is_head_only_and_not_in_docker_argv() -> None:
                 values[name] = str(fixture)
             for name in ("CACHE_ROOT", "TRITON_HOST_CACHE", "TILELANG_HOST_CACHE"):
                 values[name] = str(root / "cache")
-            values.update(USE_HOST_NCCL="0", VLLM_API_KEY=key)
+            values.update(USE_HOST_NCCL="0", VLLM_API_KEY=key, GLM53_EXTRA_ENV="")
             script = (
                 "set -eo pipefail\n"
                 "log() { :; }\n"
                 "die() { printf '%s\\n' \"$*\" >&2; exit 1; }\n"
                 "scp() { :; }\n"
+                '_hf_mount() { printf \'%s\\n\' "$HF_CACHE_DIR:/root/.cache/huggingface"; }\n'
                 "worker_ssh() { printf '%s\\0' \"$@\" >> \"$WORKER_CAPTURE\"; }\n"
                 + "\n".join(f"{name}={shlex.quote(value)}" for name, value in values.items())
                 + "\n" + launch + "\nlaunch_cluster\n"

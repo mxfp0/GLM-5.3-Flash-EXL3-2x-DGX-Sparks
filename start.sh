@@ -41,6 +41,15 @@
 #   ./start.sh status             containers + API health
 #   ./start.sh logs               follow head logs
 #   ./start.sh logs worker        follow worker container logs
+#   ./start.sh share              NFS_SHARE=1 only: re-export the head HF
+#                                 cache and remount it on the worker
+#
+# Lifecycle commands on this checkout are serialized by a flock on
+# logs/cluster.lock: start/restart refuse immediately when another lifecycle
+# command owns it, and stop waits up to 30s and then exits 1 WITHOUT stopping
+# anything — retry once the running command exits. The lock is per checkout
+# and covers TP=2 only: another clone, manual docker commands and the
+# start-tp3.sh / start-tp4.sh stacks are not serialized by it.
 #
 # Node IPs live in .env (copied from .env.example on first run).
 # Handy overrides: SKIP_DOWNLOAD=1 SKIP_SYNC=1 SKIP_PULL=1 SKIP_SHIP=1 SKIP_BUILD=1 PULL=1 BUILD=1 TAIL=1 HF_TOKEN=...
@@ -83,6 +92,33 @@ MODEL_CACHE_NAME="${MODEL_CACHE_NAME:-models--${MODEL//\//--}}"
 MODEL_FALLBACK_CACHE_NAME="${MODEL_FALLBACK_CACHE_NAME:-models--${MODEL_FALLBACK//\//--}}"
 # Hub commit on the Mia-AiLab mirror (the 5ab363a8-byte-identical upload).
 MODEL_REVISION="${MODEL_REVISION:-25a44fdbf16862a46b7cc9921142c6c81350af2f}"
+# Optional pinned-checkpoint preset (start-abliterated.sh). It pins repo,
+# fallback, revision and inventory, and that exact snapshot is then required on
+# every path: refs/main is not consulted for it, and a complete but different
+# cached revision does not satisfy the checks.
+MODEL_SNAPSHOT=""
+MODEL_FALLBACK_SNAPSHOT=""
+MODEL_PINNED_SHARDS=""
+GLM53_MODEL_PRESET="${GLM53_MODEL_PRESET:-}"
+case "$GLM53_MODEL_PRESET" in
+    "") ;;
+    abliterated)
+        MODEL="bullerwins/GLM-5.3-Flash-exl3-4bpw-ablit"
+        MODEL_FALLBACK="$MODEL"
+        MODEL_REVISION="14858211ed81d7fa773f8a0db02f38f36d230252"
+        MODEL_SNAPSHOT="$MODEL_REVISION"
+        MODEL_FALLBACK_SNAPSHOT="$MODEL_SNAPSHOT"
+        MODEL_CACHE_NAME="models--bullerwins--GLM-5.3-Flash-exl3-4bpw-ablit"
+        MODEL_FALLBACK_CACHE_NAME="$MODEL_CACHE_NAME"
+        # Published manifest at the pin: 120 safetensors shards (175642157752
+        # bytes) plus config.json / model.safetensors.index.json / ABLIT_META.json.
+        MODEL_PINNED_SHARDS=120
+        ;;
+    *)
+        printf 'FATAL: unknown GLM53_MODEL_PRESET: %s\n' "$GLM53_MODEL_PRESET" >&2
+        exit 2
+        ;;
+esac
 IMAGE="${IMAGE:-ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-GLM-5.3-Flash-EXL3}"
 GHCR_USER="${GHCR_USER:-MiaAI-Lab}"
@@ -155,6 +191,19 @@ MAX_NUM_SEQS="${MAX_NUM_SEQS:-4}"
 # 8192 chunk × long history oversubscribes GB10 persistent_topk smem (300k crash).
 # E2 one-shot 2026-09-01: 7168 keep (100k ~1148 / 300k ~1107); 2048/3548 similar or slower.
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-7168}"
+# Decode hygiene (issue #43): without a server default, omitted chat limits
+# may consume the entire remaining context budget and grow KV enough to
+# preempt other sessions. A bounded omitted-request default limits that risk.
+# This is not a cap: overlay/patch_default_max_new_tokens.py changes only the serving
+# layer's omitted-request fallback. Explicit client limits override this
+# default; independently configured server/platform and context caps remain.
+# Admission in this vLLM is chunk-based (allocate_slots per
+# chunk), so this does NOT gate admission; long-context concurrency is
+# governed by the effective KV pool (see issue #43 measurements).
+# Unset-only expansion: explicit empty preserves stock model/server limits,
+# and a caller export — including empty — beats .env.
+# Two-node start.sh only; start-tp4.sh is unchanged.
+DEFAULT_MAX_NEW_TOKENS="${DEFAULT_MAX_NEW_TOKENS-65536}"
 # Empty preserves the stock scheduler; opt in after measuring contention.
 LONG_PREFILL_TOKEN_THRESHOLD="${LONG_PREFILL_TOKEN_THRESHOLD:-}"
 CHAT_TEMPLATE_HOST="${CHAT_TEMPLATE_HOST:-$SCRIPT_DIR/files/chat_template.jinja}"
@@ -165,11 +214,15 @@ SCHED_PATCH_HOST="${SCHED_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_scheduler_decode
 DRAFTER_PATCH_HOST="${DRAFTER_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_glm5_drafter_group.py}"
 APC_PATCH_HOST="${APC_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_hybrid_prefix_hit.py}"
 PERGROUP_PATCH_HOST="${PERGROUP_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_apc_per_group_retention.py}"
+NOSTORE_PATCH_HOST="${NOSTORE_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_apc_no_store.py}"
+KVCAP_PATCH_HOST="${KVCAP_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_kv_capacity_log.py}"
 XGRAMMAR_PATCH_HOST="${XGRAMMAR_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_xgrammar_termination.py}"
+CACHE_RESET_PATCH_HOST="${CACHE_RESET_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_cache_reset.py}"
 KPOOL_TAIL_PATCH_HOST="${KPOOL_TAIL_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_kpool_tail_slotmap.py}"
 SPINWAIT_PATCH_HOST="${SPINWAIT_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_spinwait.py}"
 ADAPTIVE_K_PATCH_HOST="${ADAPTIVE_K_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_adaptive_k.py}"
 DENSE_FP8_PATCH_HOST="${DENSE_FP8_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_dense_fp8.py}"
+DEFAULT_TOKENS_PATCH_HOST="${DEFAULT_TOKENS_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_default_max_new_tokens.py}"
 EXL3_OVERLAY_HOST="${EXL3_OVERLAY_HOST:-$SCRIPT_DIR/overlay/exl3.py}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
 QUANTIZATION="${QUANTIZATION:-exl3}"
@@ -177,8 +230,26 @@ LANGUAGE_MODEL_ONLY="${LANGUAGE_MODEL_ONLY:-0}"
 SKIP_MM_PROFILING="${SKIP_MM_PROFILING:-1}"
 # JSON default cannot sit in ${LIMIT_MM:-{...}} — } ends the expansion.
 if [ -z "${LIMIT_MM:-}" ]; then
-    LIMIT_MM='{"image":100,"video":1}'
+    LIMIT_MM='{"image":48,"video":1}'
 fi
+# Vision cost caps. 2026-09-14: a chat client split an 11.9 MB video into ~33
+# frames and posted them as images. The checkpoint's processor_config.json
+# allows max_image_tokens=8000, so each frame cost ~7.2k tokens and the prompt
+# reached 236k tokens of vision encode. SKIP_MM_PROFILING reserves nothing for
+# the tower, so the host OOM-killer took VLLM::Worker_TP and the engine died.
+# ${VAR-default} not ${VAR:-default}: an explicitly empty value means stock vLLM.
+#   MM_IMAGE_TOKENS        per-image token budget. Must stay <=
+#                          MAX_NUM_BATCHED_TOKENS, which is also vLLM's encoder
+#                          cache size — the checkpoint's 8000 exceeds our 7168.
+#                          A 1080p frame is 2691 tokens uncapped, 2040 at 2048.
+#   VIDEO_NUM_FRAMES       frames sampled from a real video_url item. Empty =
+#                          vLLM's VideoMediaIO default (32). Untested here: the
+#                          09-14 crash came in over the image path.
+#   MM_PROCESSOR_CACHE_GB  host RAM held for processed media. vLLM defaults to
+#                          4 GiB; on UMA that is 4 GiB the model cannot have.
+MM_IMAGE_TOKENS="${MM_IMAGE_TOKENS-2048}"
+VIDEO_NUM_FRAMES="${VIDEO_NUM_FRAMES-}"
+MM_PROCESSOR_CACHE_GB="${MM_PROCESSOR_CACHE_GB-1}"
 TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-12.1a}"
 FLASHINFER_CUDA_ARCH_LIST="${FLASHINFER_CUDA_ARCH_LIST:-12.1a}"
 # Graph-safe fused apply (device-side expert grouping). MTP k=2 decode is
@@ -243,21 +314,47 @@ EXL3_FAT_KERNEL="${EXL3_FAT_KERNEL:-1}"
 # --- abliteration (ablit/) --------------------------------------------------
 # Load-time o_proj orthogonalization (overlay/ablit_runtime.py). Published
 # recipe: layers 15-45 edited with the dealign direction, 0-14 stay stock
-# safety anchors, MTP block included. 0 = stock weights. Applied identically
-# on both TP ranks; the DFlash2 drafter is never touched.
+# safety anchors, MTP block included. 0 leaves checkpoint weights unchanged.
+# Applied identically on both TP ranks; the DFlash2 drafter is never touched.
 ABLIT="${ABLIT:-0}"
 ABLIT_METHOD="${ABLIT_METHOD:-auto}"           # auto | transplant | proj
 ABLIT_DIRECTION="${ABLIT_DIRECTION:-dealign}"  # dealign | bf_oproj | /path/dir.pt
 ABLIT_LAYERS="${ABLIT_LAYERS:-15-45}"          # inclusive; 45 = checkpoint MTP block
 ABLIT_ALPHA="${ABLIT_ALPHA:-3.0}"              # 1.0 = plain projection, >1 over-projects
 ABLIT_INCLUDE_MTP="${ABLIT_INCLUDE_MTP:-1}"
+# The preset's checkpoint already carries the o_proj transplant: applying the
+# runtime edit again would produce a different model, so the preset forces
+# ABLIT=0 over any caller value.
+[ "$GLM53_MODEL_PRESET" = "abliterated" ] && ABLIT=0
 
 READY_TIMEOUT="${READY_TIMEOUT:-3600}"
 # 1 = suppress client stop strings until </think> (DSpark #42 class).
 GLM53_SUPPRESS_STOPS_IN_REASONING="${GLM53_SUPPRESS_STOPS_IN_REASONING:-1}"
 # Mixed-step prefill policy when a peer is already decoding (issue #6).
-# skip = do not mix; N>0 = cap tokens; 0 = off.
-GLM53_MIXED_PREFILL_CHUNK="${GLM53_MIXED_PREFILL_CHUNK:-skip}"
+# fair = time-share mixing (default since 2026-09-15, overlay v5);
+# skip = do not mix (starves waiting prefills until the decode ends);
+# N>0 = cap mixed prefill tokens; 0 / off = no isolation.
+# Fair knobs are forwarded on every rank even when CHUNK is not fair.
+# fair v5: fixed+per-token step-cost fit, largest chunk that fits MAX_STEP_MS,
+# prompt step-bounded newcomer probe, bounded contention credit, decode first.
+GLM53_MIXED_PREFILL_CHUNK="${GLM53_MIXED_PREFILL_CHUNK:-fair}"
+GLM53_FAIR_PREFILL_CHUNK="${GLM53_FAIR_PREFILL_CHUNK:-256}"
+GLM53_FAIR_PREFILL_SHARE="${GLM53_FAIR_PREFILL_SHARE:-0.20}"
+GLM53_FAIR_PREFILL_MAX_INTERVAL_MS="${GLM53_FAIR_PREFILL_MAX_INTERVAL_MS:-2000}"
+GLM53_FAIR_PREFILL_MAX_STEP_MS="${GLM53_FAIR_PREFILL_MAX_STEP_MS:-1000}"
+GLM53_FAIR_PREFILL_MAX_CHUNKS="${GLM53_FAIR_PREFILL_MAX_CHUNKS:-1}"
+# Space-separated NAME=VALUE list of extra env for both container ranks (diagnostics, e.g. VLLM_DEBUG_WORKSPACE=1).
+GLM53_EXTRA_ENV="${GLM53_EXTRA_ENV:-}"
+# 1 = at boot, after vLLM's "GPU KV cache size: N tokens" line (which is
+# max_concurrency x max_model_len, not a pool size), log one line per KV-cache
+# group (spec, block_size, blocks per max_model_len request) and a summary with
+# the usable block ids, the ids one aligned cached segment costs across groups
+# and the resulting cached-conversation capacity (overlay
+# patch_kv_capacity_log.py). 0 = do not log (one line saying so). Log-only:
+# no serving behaviour changes either way. Default applies only when UNSET: an
+# explicitly empty value is an operator error and validate_numeric_config
+# rejects it.
+GLM53_KV_CAPACITY_LOG="${GLM53_KV_CAPACITY_LOG-1}"
 # Adaptive verification length (overlay/patch_adaptive_k.py). off = stock k=7 every step.
 GLM53_ADAPTIVE_K="${GLM53_ADAPTIVE_K:-off}"
 GLM53_ADAPTIVE_K_SET="${GLM53_ADAPTIVE_K_SET:-2,4,7}"
@@ -271,6 +368,12 @@ GLM53_ADAPTIVE_K_HIST="${GLM53_ADAPTIVE_K_HIST:-200}"
 GLM53_DENSE_FP8="${GLM53_DENSE_FP8:-off}"
 # Empty leaves the template's omitted-effort fallback unchanged.
 GLM53_DEFAULT_REASONING_EFFORT="${GLM53_DEFAULT_REASONING_EFFORT-}"
+# 1 = honour the per-request GPU prefix-cache no-store flag
+# (vllm_xargs {"skip_writing_prefix_cache": 1}; overlay patch_apc_no_store.py);
+# 0 = ignore it (logged once). Requests never opt in by default, so 1 changes
+# nothing until a client asks. Default applies only when UNSET: an explicitly
+# empty value is an operator error and validate_numeric_config rejects it.
+GLM53_APC_NO_STORE="${GLM53_APC_NO_STORE-1}"
 # Sparse-indexer prefill gather workspace (overlay/patch_indexer_workspace.py).
 # stock = max_model_len * 40 entries (5036.40 MB locked at 1M, measured);
 # rightsize = the legal per-step maximum, ~+26% KV (default since 2026-09-07:
@@ -287,6 +390,14 @@ VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS="${VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS:-1800}"
 # 1 = after /health, burn DFlash2 BLOCK / sampler / kpool shapes. Nonfatal.
 GLM53_BOOT_SHAPE_WARMUP="${GLM53_BOOT_SHAPE_WARMUP:-1}"
 GLM53_WARMUP_REQ_TIMEOUT="${GLM53_WARMUP_REQ_TIMEOUT:-240}"
+# 1 = mount ONLY the cache-reset dev routes (/reset_prefix_cache, /reset_mm_cache,
+# /reset_encoder_cache — issue #31) on the head API server, so cold bench runs
+# can reset the prefix cache without a restart. Opt-in (default 0) on purpose:
+# the caveat is auth, not stability — root-mounted routes sit outside the bearer
+# guard (GUARDED_PREFIX), so a shared kit must ask for this explicitly.
+# This flag does not enable other dev routes or override independent
+# VLLM_SERVER_DEV_MODE, which retains precedence. Restart applies the flag.
+GLM53_EXPOSE_CACHE_RESET="${GLM53_EXPOSE_CACHE_RESET:-0}"
 
 # OpenAI-compatible API bearer token. Read the native VLLM_API_KEY env var
 # (vLLM falls back to it when --api-key is absent on the CLI), so the key
@@ -314,14 +425,48 @@ TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-/root/.triton/cache}"
 TILELANG_CACHE_DIR="${TILELANG_CACHE_DIR:-/root/.tilelang/cache}"
 
 LOGDIR="$SCRIPT_DIR/logs"
+# TP2 lifecycle lock (helpers below). start/restart take it without waiting;
+# stop waits CLUSTER_LOCK_WAIT seconds and then refuses with exit 1.
+CLUSTER_LOCK="$LOGDIR/cluster.lock"
+CLUSTER_LOCK_PID="$LOGDIR/cluster.lock.pid"
+CLUSTER_LOCK_WAIT=30
 HEAD_SCRIPT="$SCRIPT_DIR/.glm53-exl3-head.inner.sh"
 WORKER_SCRIPT="$SCRIPT_DIR/.glm53-exl3-worker.inner.sh"
 EXPECTED_SHARDS="${EXPECTED_SHARDS:-120}"
+# Under a preset the pinned inventory wins: a caller EXPECTED_SHARDS must not
+# lower the gate for one exact checkpoint.
+[ -n "$MODEL_PINNED_SHARDS" ] && EXPECTED_SHARDS="$MODEL_PINNED_SHARDS"
 
 # ------------------------------- helpers -----------------------------------
 log()  { printf '\033[1;36m[glm53-exl3]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[glm53-exl3]\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31m[glm53-exl3]\033[0m ERROR: %s\n' "$*" >&2; exit 1; }
+
+# Worker weight distribution. 0 (default) = rsync a full copy of the ~164 GiB
+# checkpoint to the worker, which is what this script has always done. 1 = the
+# worker mounts the head's HF cache read-only over NFSv4 on ConnectX and keeps
+# no copy (files/nfs-share.sh; same pattern as ~/NewModels/DS4.1). Opt in from
+# .env — nothing below changes while it is 0.
+NFS_SHARE="${NFS_SHARE:-0}"
+NFS_RANKS="1"
+# shellcheck source=files/nfs-share.sh
+if [ -f "$SCRIPT_DIR/files/nfs-share.sh" ]; then
+    source "$SCRIPT_DIR/files/nfs-share.sh"
+elif [ "$NFS_SHARE" = "1" ]; then
+    warn "files/nfs-share.sh missing — falling back to an rsync copy (NFS_SHARE=0)"
+    NFS_SHARE=0
+fi
+
+# What the worker bind-mounts at /root/.cache/huggingface. Read-only over NFS is
+# safe: the container runs HF_HUB_OFFLINE=1 / TRANSFORMERS_OFFLINE=1 and its
+# writable Triton/TileLang/vLLM caches are separate node-local mounts.
+_hf_mount() {
+    if [ "${NFS_SHARE:-0}" = "1" ]; then
+        nfs_hf_mount_spec
+    else
+        printf '%s:/root/.cache/huggingface' "$WORKER_CACHE_DIR"
+    fi
+}
 
 # GLM53 numeric config guard (begin)
 _glm53_canonical_positive_int() {
@@ -378,6 +523,16 @@ _glm53_validate_retention_interval() {
     export "$name"
 }
 
+# Validate no-store and KV-capacity-log switches before restart stops anything;
+# both overlays reject values other than exactly 0 or 1 at runtime.
+_glm53_validate_bool_flag() {
+    local name="$1" value="$2"
+    if [ "$value" != 0 ] && [ "$value" != 1 ]; then
+        echo "$name must be exactly 0 or 1 (got: $value)" >&2
+        return 2
+    fi
+}
+
 # Enum knobs are exactly one of a fixed set. Not "non-empty means on": a
 # typo'd knob must not silently pick a serving mode. GLM53_INDEXER_WORKSPACE
 # sizes the sparse-indexer prefill workspace, and the patched
@@ -405,6 +560,45 @@ _glm53_validate_spinwait_ms() {
         GLM53_SPINWAIT_MS "$GLM53_SPINWAIT_MS" 1000
 }
 
+# skip / -1 / 0 / off / no / fair / positive integer <= MNBT.
+# Companion fair knobs are validated when set so a typo cannot reach one rank.
+_glm53_validate_mixed_prefill() {
+    if [ -n "${GLM53_MIXED_PREFILL_CHUNK+x}" ]; then
+        case "$GLM53_MIXED_PREFILL_CHUNK" in
+            skip|-1|0|off|no|fair) ;;
+            *)
+                _glm53_canonical_positive_int GLM53_MIXED_PREFILL_CHUNK \
+                    "$GLM53_MIXED_PREFILL_CHUNK" "$MAX_NUM_BATCHED_TOKENS" || return
+                ;;
+        esac
+        export GLM53_MIXED_PREFILL_CHUNK
+    fi
+    if [ -n "${GLM53_FAIR_PREFILL_CHUNK:-}" ]; then
+        _glm53_canonical_positive_int GLM53_FAIR_PREFILL_CHUNK \
+            "$GLM53_FAIR_PREFILL_CHUNK" "$MAX_NUM_BATCHED_TOKENS" || return
+    fi
+    if [ -n "${GLM53_FAIR_PREFILL_MAX_INTERVAL_MS:-}" ]; then
+        _glm53_canonical_positive_int GLM53_FAIR_PREFILL_MAX_INTERVAL_MS \
+            "$GLM53_FAIR_PREFILL_MAX_INTERVAL_MS" 600000 || return
+    fi
+    if [ -n "${GLM53_FAIR_PREFILL_MAX_STEP_MS:-}" ]; then
+        _glm53_canonical_positive_int GLM53_FAIR_PREFILL_MAX_STEP_MS \
+            "$GLM53_FAIR_PREFILL_MAX_STEP_MS" 600000 || return
+    fi
+    if [ -n "${GLM53_FAIR_PREFILL_MAX_CHUNKS:-}" ]; then
+        _glm53_canonical_positive_int GLM53_FAIR_PREFILL_MAX_CHUNKS \
+            "$GLM53_FAIR_PREFILL_MAX_CHUNKS" 16 || return
+    fi
+    if [ -n "${GLM53_FAIR_PREFILL_SHARE:-}" ]; then
+        if ! [[ "$GLM53_FAIR_PREFILL_SHARE" =~ ^(0([.][0-9]+)?|[.][0-9]+|1([.]0+)?)$ ]] \
+           || ! awk -v u="$GLM53_FAIR_PREFILL_SHARE" 'BEGIN { exit !(u >= 0 && u <= 1) }'; then
+            echo "GLM53_FAIR_PREFILL_SHARE must be between 0 and 1 (got: $GLM53_FAIR_PREFILL_SHARE)" >&2
+            return 2
+        fi
+        export GLM53_FAIR_PREFILL_SHARE
+    fi
+}
+
 validate_numeric_config() {
     if ! [[ "$GPU_MEM_UTIL" =~ ^(0([.][0-9]+)?|[.][0-9]+|1([.]0+)?)$ ]] \
        || ! awk -v u="$GPU_MEM_UTIL" 'BEGIN { exit !(u > 0 && u <= 1) }'; then
@@ -418,14 +612,23 @@ validate_numeric_config() {
         _glm53_canonical_positive_int LONG_PREFILL_TOKEN_THRESHOLD \
             "$LONG_PREFILL_TOKEN_THRESHOLD" "$MAX_NUM_BATCHED_TOKENS" || return
     fi
+    # Empty preserves stock limits; a set value must canonicalize
+    # before restart stops the healthy pair.
+    if [ -n "${DEFAULT_MAX_NEW_TOKENS:-}" ]; then
+        _glm53_canonical_positive_int DEFAULT_MAX_NEW_TOKENS \
+            "$DEFAULT_MAX_NEW_TOKENS" 1000000 || return
+    fi
     _glm53_validate_enum GLM53_INDEXER_WORKSPACE "${GLM53_INDEXER_WORKSPACE-rightsize}" \
         stock rightsize || return
     _glm53_validate_spinwait_ms || return
+    _glm53_validate_bool_flag GLM53_APC_NO_STORE "${GLM53_APC_NO_STORE-1}" || return
+    _glm53_validate_bool_flag GLM53_KV_CAPACITY_LOG "${GLM53_KV_CAPACITY_LOG-1}" || return
     # The template treats medium as max, so do not advertise it as a level.
     if [ -n "${GLM53_DEFAULT_REASONING_EFFORT-}" ]; then
         _glm53_validate_enum GLM53_DEFAULT_REASONING_EFFORT \
             "$GLM53_DEFAULT_REASONING_EFFORT" low high max || return
     fi
+    _glm53_validate_mixed_prefill || return
     _glm53_validate_retention_interval GLM53_APC_RETENTION_INTERVAL "${GLM53_APC_RETENTION_INTERVAL-}" || return
     _glm53_validate_retention_interval GLM53_APC_RETENTION_INTERVAL_SWA "${GLM53_APC_RETENTION_INTERVAL_SWA-}" || return
     if [ -n "${GLM53_APC_RETENTION_INTERVAL_SWA:-}" ] && [ "$SPEC_METHOD" != "dflash" ]; then
@@ -482,11 +685,15 @@ validate_overlay_artifacts() {
         "$DRAFTER_PATCH_HOST|vllm/v1/core/kv_cache_utils.py|$main_guard"
         "$APC_PATCH_HOST|[glm53-hybrid-apc]|$main_guard"
         "$PERGROUP_PATCH_HOST|glm53-apc-per-group-contract:explicit-v1|$main_guard"
+        "$NOSTORE_PATCH_HOST|[glm53-apc-no-store]|$main_guard"
+        "$KVCAP_PATCH_HOST|[glm53-kv-capacity-log]|$main_guard"
         "$XGRAMMAR_PATCH_HOST|vllm/v1/structured_output/|$main_guard"
         "$KPOOL_TAIL_PATCH_HOST|[glm53-kpool-tail-slotmap]|$main_guard"
         "$SPINWAIT_PATCH_HOST|device_communicators/shm_broadcast.py|$main_guard"
         "$ADAPTIVE_K_PATCH_HOST|[glm53-adaptive-k]|$main_guard"
         "$DENSE_FP8_PATCH_HOST|[glm53-dense-fp8]|$main_guard"
+        "$DEFAULT_TOKENS_PATCH_HOST|[glm53-default-max-new-tokens]|    raise SystemExit(main(sys.argv))"
+        "$CACHE_RESET_PATCH_HOST|# [glm53-cache-reset]|$main_guard"
         "$SCRIPT_DIR/overlay/patch_ablit.py|$ablit_marker|    main()"
         "$SCRIPT_DIR/overlay/ablit_runtime.py|o_proj abliteration (ABLIT)|    return report"
     )
@@ -552,6 +759,36 @@ validate_overlay_artifacts() {
 }
 # GLM53 overlay artifact guard (end)
 
+# Serialize the TP2 lifecycle commands (start / restart / stop) so a second
+# launcher cannot docker-rm the first's containers mid wait_for_health (false
+# "head container exited" + empty logs). The flock on $CLUSTER_LOCK is the
+# authoritative owner; $CLUSTER_LOCK_PID is advisory diagnostics only — never
+# proof of ownership, and no PID is ever signalled.
+with_cluster_lock() {
+    mkdir -p "$LOGDIR"
+    exec 9>"$CLUSTER_LOCK"
+    if ! flock -n 9; then
+        local holder
+        holder="$(tr -d '[:space:]' <"$CLUSTER_LOCK_PID" 2>/dev/null || true)"
+        die "another start.sh/restart is already running${holder:+ (pid $holder)} — retry after it exits"
+    fi
+    echo $$ >"$CLUSTER_LOCK_PID" 2>/dev/null || true
+}
+
+# stop waits up to CLUSTER_LOCK_WAIT for the same lock and then refuses with
+# exit 1: no container is stopped, no PID metadata is written, and the lock
+# file is left alone. Retry once the start/restart holding it exits.
+with_cluster_lock_for_stop() {
+    mkdir -p "$LOGDIR"
+    exec 9>"$CLUSTER_LOCK"
+    if ! flock -w "$CLUSTER_LOCK_WAIT" 9; then
+        local holder
+        holder="$(tr -d '[:space:]' <"$CLUSTER_LOCK_PID" 2>/dev/null || true)"
+        die "cluster lock still held after ${CLUSTER_LOCK_WAIT}s${holder:+ (pid $holder)} — nothing was stopped; retry once that start.sh/restart exits"
+    fi
+    echo $$ >"$CLUSTER_LOCK_PID" 2>/dev/null || true
+}
+
 banner() {
     local label="${1:-start.sh}"
     printf '\n'
@@ -563,18 +800,44 @@ banner() {
 
 worker_ssh() { ssh -T -o BatchMode=yes -o ConnectTimeout=15 "$WORKER_SSH" "$@"; }
 
-usage() { sed -n '2,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+# Print the whole header block: everything between the shebang and
+# `set -euo pipefail`, minus the ==== rulers. Beats a magic line number, which
+# silently truncated ./start.sh status/logs/share out of --help.
+usage() {
+    sed -n '2,/^set -euo pipefail/p' "${BASH_SOURCE[0]}" \
+        | sed -e '/^set -euo pipefail/d' -e '/^# =\{10,\}$/d' -e 's/^# \{0,1\}//'
+}
 
 count_shards() {
-    local repo_path="$1" ref
-    ref="$(cat "$repo_path/refs/main" 2>/dev/null || true)"
-    [ -n "$ref" ] || ref="$(ls -1t "$repo_path/snapshots" 2>/dev/null | head -n 1 || true)"
+    local repo_path="$1" snapshot="${2:-}" ref
+    if [ -n "$snapshot" ]; then
+        ref="$snapshot"
+    else
+        ref="$(cat "$repo_path/refs/main" 2>/dev/null || true)"
+        [ -n "$ref" ] || ref="$(ls -1t "$repo_path/snapshots" 2>/dev/null | head -n 1 || true)"
+    fi
     if [ -z "$ref" ]; then
         printf '0'
         return
     fi
+    # -L + -type f: a shard entry counts only when the link resolves to a real
+    # regular file, so dangling links and directories are not counted.
     find -L "$repo_path/snapshots/$ref" -maxdepth 1 -type f -name '*.safetensors' 2>/dev/null \
         | wc -l | tr -d '[:space:]' || true
+}
+
+# Completeness of the selected snapshot: the shard count (count_shards follows
+# shard links to their blobs) plus the two loader-required sidecars. A preset
+# passes its pinned revision, so an unrelated complete revision cannot satisfy
+# it; the required count is EXPECTED_SHARDS, which the preset pins to its own
+# inventory.
+model_tree_complete() {
+    local repo_path="$1" snapshot="${2:-}" have
+    have="$(count_shards "$repo_path" "$snapshot")"
+    [ "${have:-0}" -ge "$EXPECTED_SHARDS" ] || return 1
+    [ -z "$snapshot" ] && return 0
+    [ -f "$repo_path/snapshots/$snapshot/config.json" ] \
+        && [ -f "$repo_path/snapshots/$snapshot/model.safetensors.index.json" ]
 }
 
 ensure_refs_main() {
@@ -587,10 +850,23 @@ ensure_refs_main() {
     log "wrote refs/main -> $snap (hf download left it empty)"
 }
 
+# Fail-closed gate for every pinned path: a preset resolves, syncs and serves
+# exactly its own snapshot or the launch stops.
+require_model_snapshot() {
+    [ -n "$MODEL_SNAPSHOT" ] || return 0
+    model_tree_complete "$MODEL_PATH" "$MODEL_SNAPSHOT" \
+        || die "pinned model snapshot is incomplete: $MODEL_PATH/snapshots/$MODEL_SNAPSHOT"
+}
+
 resolve_model_dir() {
     local ref="$MODEL_PATH/refs/main" hash dir
-    ensure_refs_main
-    hash="$(<"$ref")"
+    if [ -n "$MODEL_SNAPSHOT" ]; then
+        require_model_snapshot
+        hash="$MODEL_SNAPSHOT"
+    else
+        ensure_refs_main
+        hash="$(<"$ref")"
+    fi
     dir="$MODEL_PATH/snapshots/$hash"
     [ -f "$dir/config.json" ] || die "config.json missing in $dir — re-run with REFRESH_WEIGHTS=1"
     printf '/root/.cache/huggingface/hub/%s/snapshots/%s' "$MODEL_CACHE_NAME" "$hash"
@@ -624,12 +900,56 @@ check_port_free() {
     local port="$1" envname="$2"
     command -v ss >/dev/null 2>&1 || return 0
     if ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${port}\$"; then
-        if docker inspect -f '{{.State.Running}}' "$CONTAINER_HEAD" 2>/dev/null | grep -q true; then
+        # Do not pipe docker inspect into grep -q: pipefail can turn grep's
+        # early close into a false negative when docker gets SIGPIPE.
+        if [ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER_HEAD" 2>/dev/null || true)" = "true" ]; then
             die "port ${port} is held by ${CONTAINER_HEAD} — use './start.sh restart' or './start.sh stop' first"
         fi
         die "port ${port} is already in use — stop it or rerun with ${envname}=<free-port>"
     fi
 }
+
+# GLM53 preflight memory guard (begin)
+read_meminfo_kib() {
+    local source_file="${1:-/proc/meminfo}"
+    awk '
+      /^MemTotal:/ { total=$2 }
+      /^MemAvailable:/ { available=$2 }
+      END {
+        if (!total || !available) exit 1
+        print total, available
+      }
+    ' "$source_file"
+}
+
+preflight_memory() {
+    local label="$1" total_kib="$2" available_kib="$3" util="$4"
+    local headroom_kib="${GLM53_PREFLIGHT_MEMORY_HEADROOM_KIB:-2097152}"
+    local total_gib available_gib requested_gib headroom_gib
+
+    if ! [[ "$total_kib" =~ ^[0-9]+$ && "$available_kib" =~ ^[0-9]+$ && "$headroom_kib" =~ ^[0-9]+$ ]]; then
+        echo "PREFLIGHT FAIL [$label]: invalid memory reading" >&2
+        return 2
+    fi
+    if ! [[ "$util" =~ ^(0([.][0-9]+)?|[.][0-9]+|1([.]0+)?)$ ]] \
+       || ! awk -v u="$util" 'BEGIN { exit !(u > 0 && u <= 1) }'; then
+        echo "PREFLIGHT FAIL [$label]: GPU_MEM_UTIL must be greater than 0 and at most 1: $util" >&2
+        return 2
+    fi
+
+    total_gib=$(awk -v k="$total_kib" 'BEGIN { printf "%.2f", k/1048576 }')
+    available_gib=$(awk -v k="$available_kib" 'BEGIN { printf "%.2f", k/1048576 }')
+    requested_gib=$(awk -v t="$total_kib" -v u="$util" 'BEGIN { printf "%.2f", (t*u)/1048576 }')
+    headroom_gib=$(awk -v k="$headroom_kib" 'BEGIN { printf "%.2f", k/1048576 }')
+
+    if ! awk -v a="$available_kib" -v t="$total_kib" -v u="$util" -v h="$headroom_kib" \
+        'BEGIN { exit !(a >= (t*u)+h) }'; then
+        echo "PREFLIGHT FAIL [$label]: MemAvailable=${available_gib} GiB of ${total_gib} GiB; GPU_MEM_UTIL=${util} requests ${requested_gib} GiB plus ${headroom_gib} GiB headroom" >&2
+        return 1
+    fi
+    echo "PREFLIGHT OK [$label]: MemAvailable=${available_gib}/${total_gib} GiB; request=${requested_gib} GiB plus ${headroom_gib} GiB headroom"
+}
+# GLM53 preflight memory guard (end)
 
 trap 'warn "interrupted — containers keep running ('"'"'./start.sh logs'"'"' to watch, '"'"'./start.sh stop'"'"' to stop)"; exit 130' INT
 
@@ -702,16 +1022,30 @@ preflight() {
     check_port_free "$PORT" PORT
     check_port_free "$MASTER_PORT" MASTER_PORT
 
+    local head_mem worker_mem head_total head_available worker_total worker_available
+    head_mem="$(read_meminfo_kib /proc/meminfo)" \
+        || die "cannot read MemTotal/MemAvailable on head"
+    worker_mem="$(worker_ssh "cat /proc/meminfo" | read_meminfo_kib /dev/stdin)" \
+        || die "cannot read MemTotal/MemAvailable on worker"
+    read -r head_total head_available <<< "$head_mem"
+    read -r worker_total worker_available <<< "$worker_mem"
+    preflight_memory head "$head_total" "$head_available" "$GPU_MEM_UTIL" || return
+    preflight_memory worker "$worker_total" "$worker_available" "$GPU_MEM_UTIL" || return
+
     [ -f "$STOP_PATCH_HOST" ] || die "$STOP_PATCH_HOST missing"
     [ -f "$SCHED_PATCH_HOST" ] || die "$SCHED_PATCH_HOST missing"
     [ -f "$DRAFTER_PATCH_HOST" ] || die "$DRAFTER_PATCH_HOST missing"
     [ -f "$APC_PATCH_HOST" ] || die "$APC_PATCH_HOST missing"
     [ -f "$PERGROUP_PATCH_HOST" ] || die "$PERGROUP_PATCH_HOST missing"
+    [ -f "$NOSTORE_PATCH_HOST" ] || die "$NOSTORE_PATCH_HOST missing"
+    [ -f "$KVCAP_PATCH_HOST" ] || die "$KVCAP_PATCH_HOST missing"
     [ -f "$XGRAMMAR_PATCH_HOST" ] || die "$XGRAMMAR_PATCH_HOST missing"
+    [ -f "$CACHE_RESET_PATCH_HOST" ] || die "$CACHE_RESET_PATCH_HOST missing"
     [ -f "$KPOOL_TAIL_PATCH_HOST" ] || die "$KPOOL_TAIL_PATCH_HOST missing"
     [ -f "$SPINWAIT_PATCH_HOST" ] || die "$SPINWAIT_PATCH_HOST missing"
     [ -f "$ADAPTIVE_K_PATCH_HOST" ] || die "$ADAPTIVE_K_PATCH_HOST missing"
     [ -f "$DENSE_FP8_PATCH_HOST" ] || die "$DENSE_FP8_PATCH_HOST missing"
+    [ -f "$DEFAULT_TOKENS_PATCH_HOST" ] || die "$DEFAULT_TOKENS_PATCH_HOST missing"
     [ -f "$EXL3_OVERLAY_HOST" ] || die "$EXL3_OVERLAY_HOST missing"
     [ -f "$SCRIPT_DIR/overlay/patch_ablit.py" ] || die "$SCRIPT_DIR/overlay/patch_ablit.py missing"
     [ -f "$SCRIPT_DIR/overlay/ablit_runtime.py" ] || die "$SCRIPT_DIR/overlay/ablit_runtime.py missing"
@@ -724,15 +1058,19 @@ preflight() {
     mkdir -p "$HF_CACHE_DIR"
     avail=$(df -Pk "$HF_CACHE_DIR" 2>/dev/null | awk 'NR==2{print $4}' || true)
     [ "${avail:-0}" -ge "$need_kb" ] || warn "only $((avail/1024/1024)) GiB free on head for a ~164 GiB model"
-    avail=$(worker_ssh "df -Pk '$WORKER_HOME' 2>/dev/null" | awk 'NR==2{print $4}' || true)
-    [ "${avail:-0}" -ge "$need_kb" ] || warn "only $((avail/1024/1024)) GiB free on worker for a ~164 GiB model"
+    if [ "${NFS_SHARE:-0}" = "1" ]; then
+        log "NFS_SHARE=1 — worker reads the head HF cache, no local copy to size for"
+    else
+        avail=$(worker_ssh "df -Pk '$WORKER_HOME' 2>/dev/null" | awk 'NR==2{print $4}' || true)
+        [ "${avail:-0}" -ge "$need_kb" ] || warn "only $((avail/1024/1024)) GiB free on worker for a ~164 GiB model"
 
-    # The worker HF cache must be writable by the SSH user before the ~164 GiB
-    # sync starts. A root-owned ~/.cache/huggingface (prior sudo/docker
-    # prepare on the worker) otherwise fails mid-sync with a bare mkdir
-    # permission error. mkdir -p is idempotent and is what sync does anyway.
-    if ! worker_ssh "mkdir -p '$WORKER_CACHE_DIR/hub' && test -w '$WORKER_CACHE_DIR/hub'"; then
-        die "worker cannot write $WORKER_CACHE_DIR/hub as $( [ -n "${WORKER_USER:-}" ] && echo "$WORKER_USER" || echo "$USER" ) — fix ownership on the worker, e.g.: ssh $WORKER_SSH \"sudo chown -R ${WORKER_USER:-\$USER}: '$WORKER_CACHE_DIR'\""
+        # The worker HF cache must be writable by the SSH user before the ~164 GiB
+        # sync starts. A root-owned ~/.cache/huggingface (prior sudo/docker
+        # prepare on the worker) otherwise fails mid-sync with a bare mkdir
+        # permission error. mkdir -p is idempotent and is what sync does anyway.
+        if ! worker_ssh "mkdir -p '$WORKER_CACHE_DIR/hub' && test -w '$WORKER_CACHE_DIR/hub'"; then
+            die "worker cannot write $WORKER_CACHE_DIR/hub as $( [ -n "${WORKER_USER:-}" ] && echo "$WORKER_USER" || echo "$USER" ) — fix ownership on the worker, e.g.: ssh $WORKER_SSH \"sudo chown -R ${WORKER_USER:-\$USER}: '$WORKER_CACHE_DIR'\""
+        fi
     fi
 
     log "preflight OK (head=$(hostname) ${HEAD_IP}, worker=${WORKER_SSH})"
@@ -808,7 +1146,10 @@ overlay_recipe_hash() {
             "$SCRIPT_DIR/ablit" \
             -type f \
             ! -path '*/__pycache__/*' \
+            ! -path '*/.pytest_cache/*' \
             ! -path '*/ablit/transplant/*' \
+            ! -path '*/files/nfs-server/*' \
+            ! -path '*/files/nfs-share.sh' \
             ! -name '*.pyc' \
             2>/dev/null
     } | LC_ALL=C sort | xargs -d '\n' -r sha256sum | sha256sum | awk '{print $1}'
@@ -868,10 +1209,10 @@ ensure_image() {
     local head_ok=0 worker_ok=0 head_key="" worker_key=""
     if docker image inspect "$IMAGE" >/dev/null 2>&1; then
         head_ok=1
-        head_key="$(local_image_key)"
+        head_key="$(local_image_key || true)"
     fi
     if worker_ssh "docker image inspect '$IMAGE' >/dev/null 2>&1"; then
-        worker_key="$(worker_image_key)"
+        worker_key="$(worker_image_key || true)"
         if images_match "$head_key" "$worker_key"; then
             worker_ok=1
         else
@@ -896,13 +1237,13 @@ ensure_image() {
     fi
     if [ "${BUILD:-0}" = "1" ]; then
         build_image
-        head_key="$(local_image_key)"
+        head_key="$(local_image_key || true)"
         head_ok=1
         worker_ok=0
     elif image_from_registry && [ "$skip_pull" != "1" ]; then
         local before_key="$head_key"
         pull_image
-        head_key="$(local_image_key)"
+        head_key="$(local_image_key || true)"
         head_ok=1
         if [ "$head_key" != "$before_key" ]; then
             log "pulled ${IMAGE} (${before_key:-missing} -> ${head_key})"
@@ -919,7 +1260,7 @@ ensure_image() {
             die "SKIP_PULL=1 but ${IMAGE} is not on the head"
         fi
         build_image
-        head_key="$(local_image_key)"
+        head_key="$(local_image_key || true)"
         head_ok=1
         worker_ok=0
     fi
@@ -928,7 +1269,7 @@ ensure_image() {
     elif [ "$worker_ok" = "0" ]; then
         if image_from_registry && [ "$skip_pull" != "1" ] && [ "${BUILD:-0}" != "1" ]; then
             if pull_image_on_worker; then
-                worker_key="$(worker_image_key)"
+                worker_key="$(worker_image_key || true)"
                 if images_match "$head_key" "$worker_key"; then
                     worker_ok=1
                     log "worker pulled ${IMAGE} — matches head"
@@ -941,7 +1282,7 @@ ensure_image() {
         fi
         if [ "$worker_ok" = "0" ]; then
             ship_image_to_worker
-            worker_key="$(worker_image_key)"
+            worker_key="$(worker_image_key || true)"
             if images_match "$head_key" "$worker_key"; then
                 worker_ok=1
             elif worker_ssh "docker image inspect '$IMAGE' >/dev/null 2>&1"; then
@@ -970,18 +1311,19 @@ ensure_image() {
 # brandonmusic cache folder without a second 164 GiB pull.
 adopt_complete_weights() {
     local have
-    have="$(count_shards "$MODEL_PATH")"
-    if [ "${have:-0}" -ge "$EXPECTED_SHARDS" ]; then
-        ensure_refs_main
+    have="$(count_shards "$MODEL_PATH" "$MODEL_SNAPSHOT")"
+    if model_tree_complete "$MODEL_PATH" "$MODEL_SNAPSHOT"; then
+        [ -n "$MODEL_SNAPSHOT" ] || ensure_refs_main
         log "weights already present: $MODEL_PATH ($have shards)"
         return 0
     fi
-    have="$(count_shards "$FALLBACK_MODEL_PATH")"
-    if [ "${have:-0}" -ge "$EXPECTED_SHARDS" ]; then
+    have="$(count_shards "$FALLBACK_MODEL_PATH" "$MODEL_FALLBACK_SNAPSHOT")"
+    if model_tree_complete "$FALLBACK_MODEL_PATH" "$MODEL_FALLBACK_SNAPSHOT"; then
         log "primary cache incomplete — using fallback ${MODEL_FALLBACK} at $FALLBACK_MODEL_PATH ($have shards)"
         MODEL_PATH="$FALLBACK_MODEL_PATH"
         MODEL_CACHE_NAME="$MODEL_FALLBACK_CACHE_NAME"
-        ensure_refs_main
+        MODEL_SNAPSHOT="$MODEL_FALLBACK_SNAPSHOT"
+        [ -n "$MODEL_SNAPSHOT" ] || ensure_refs_main
         return 0
     fi
     return 1
@@ -1048,7 +1390,7 @@ download_weights() {
             || die "download of ${MODEL} and ${MODEL_FALLBACK} both failed"
     fi
     adopt_complete_weights \
-        || die "download finished with $(count_shards "$MODEL_PATH") / $EXPECTED_SHARDS shards"
+        || die "download finished with $(count_shards "$MODEL_PATH" "$MODEL_SNAPSHOT") / $EXPECTED_SHARDS shards${MODEL_SNAPSHOT:+ in the selected snapshot}"
 }
 
 download_dflash() {
@@ -1090,7 +1432,7 @@ download_only() {
     download_weights
     download_dflash
 
-    have="$(count_shards "$MODEL_PATH")"
+    have="$(count_shards "$MODEL_PATH" "$MODEL_SNAPSHOT")"
     log "======================================================================"
     log "head HF cache : ${HF_CACHE_DIR}"
     log "  target      : ${MODEL}  (${have} / ${EXPECTED_SHARDS} shards)"
@@ -1106,9 +1448,10 @@ download_only() {
 }
 
 # ------------------------------ weight sync --------------------------------
-# Keyed on the snapshot commit (refs/main, with the same repair fallback as
-# ensure_refs_main), not on MODEL_REVISION: the marker lives inside each
-# synced repo folder, so a MODEL / revision switch re-syncs automatically.
+# Keyed on the selected snapshot commit (refs/main, with the same repair
+# fallback as ensure_refs_main, or a preset's pinned revision), not on
+# MODEL_REVISION: the marker lives inside each synced repo folder, so a MODEL /
+# revision switch re-syncs automatically.
 # Without it, every ./start.sh pays a full size+mtime re-verification walk
 # over ~164 GiB / 120 shards on both ends for zero bytes of difference
 # (issue #22, item 2). FORCE_SYNC=1 bypasses the marker; deleting the
@@ -1143,20 +1486,51 @@ sync_repo_to_worker() {
     worker_ssh "printf '%s' '$rev' > '$marker'"
 }
 
+# Worker-side twin of require_model_snapshot for the rsync/SKIP_SYNC paths.
+verify_worker_model_snapshot() {
+    [ -n "$MODEL_SNAPSHOT" ] || return 0
+    # NFS_SHARE=1: the rank reads the head's tree over NFS (nfs_share_weights
+    # proves it can) — there is no worker copy to count, and the export is the
+    # tree require_model_snapshot already validated on the head.
+    [ "${NFS_SHARE:-0}" = "1" ] && return 0
+    local dir="${WORKER_CACHE_DIR}/hub/${MODEL_CACHE_NAME}/snapshots/${MODEL_SNAPSHOT}"
+    worker_ssh "test -f '$dir/config.json' \
+        && test -f '$dir/model.safetensors.index.json' \
+        && [ \"\$(find -L '$dir' -maxdepth 1 -type f -name '*.safetensors' 2>/dev/null | wc -l | tr -d '[:space:]')\" -ge '$EXPECTED_SHARDS' ]" \
+        || die "pinned model snapshot is incomplete on worker: $dir"
+}
+
 sync_weights() {
-    [ "${SKIP_SYNC:-0}" = "1" ] && { log "SKIP_SYNC=1 — not syncing to worker"; return; }
+    require_model_snapshot
+    if [ "${SKIP_SYNC:-0}" = "1" ]; then
+        verify_worker_model_snapshot
+        log "SKIP_SYNC=1 — not syncing to worker"
+        return
+    fi
     [ -d "$MODEL_PATH" ] || die "weights missing at $MODEL_PATH — run without SKIP_DOWNLOAD first"
-    sync_repo_to_worker "$MODEL_PATH" "$MODEL_CACHE_NAME" "weights"
+    if [ "${NFS_SHARE:-0}" = "1" ]; then
+        if [ "$SPEC_METHOD" = "dflash" ] && [ ! -d "$DFLASH_PATH" ]; then
+            die "DFlash2 weights missing at $DFLASH_PATH"
+        fi
+        nfs_share_weights
+        return
+    fi
+    sync_repo_to_worker "$MODEL_PATH" "$MODEL_CACHE_NAME" "weights" "$MODEL_SNAPSHOT"
     if [ "$SPEC_METHOD" = "dflash" ]; then
         [ -d "$DFLASH_PATH" ] || die "DFlash2 weights missing at $DFLASH_PATH"
         sync_repo_to_worker "$DFLASH_PATH" "$DFLASH_CACHE_NAME" "DFlash2 draft" "$DFLASH_REVISION"
     fi
+    verify_worker_model_snapshot
     log "worker weights in sync"
 }
 
 # ------------------------ inner container scripts --------------------------
 # Both ranks apply the same checked overlays. Hybrid replay precedes retention
-# because they share the coordinator helper insertion point.
+# because they share the coordinator helper insertion point; patch_apc_no_store
+# follows retention (sampling_params / request / block_pool only, no shared
+# anchors with the coordinator overlays). The KV-capacity log edits only
+# kv_cache_utils.py and follows patch_glm5_drafter_group.py, the other overlay
+# editing that file.
 GLM53_OVERLAY_ORDER=(
     patch_glm_video_placeholders.py
     patch_suppress_stops_in_reasoning.py
@@ -1164,12 +1538,16 @@ GLM53_OVERLAY_ORDER=(
     patch_glm5_drafter_group.py
     patch_hybrid_prefix_hit.py
     patch_apc_per_group_retention.py
+    patch_apc_no_store.py
+    patch_kv_capacity_log.py
     patch_xgrammar_termination.py
     patch_kpool_tail_slotmap.py
     patch_spinwait.py
     patch_adaptive_k.py
     patch_dense_fp8.py
+    patch_default_max_new_tokens.py
     patch_indexer_workspace.py
+    patch_cache_reset.py
     patch_ablit.py
 )
 
@@ -1235,8 +1613,11 @@ if [ "${LANGUAGE_MODEL_ONLY:-0}" = "1" ]; then
     say "language-model-only: no vision tower"
 else
     [ -n "${LIMIT_MM:-}" ] && ARGS+=(--limit-mm-per-prompt "${LIMIT_MM}")
+    [ -n "${MM_IMAGE_TOKENS:-}" ] && ARGS+=(--mm-processor-kwargs "{\"max_image_tokens\":${MM_IMAGE_TOKENS}}")
+    [ -n "${VIDEO_NUM_FRAMES:-}" ] && ARGS+=(--media-io-kwargs "{\"video\":{\"num_frames\":${VIDEO_NUM_FRAMES}}}")
+    [ -n "${MM_PROCESSOR_CACHE_GB:-}" ] && ARGS+=(--mm-processor-cache-gb "${MM_PROCESSOR_CACHE_GB}")
     [ "${SKIP_MM_PROFILING:-1}" = "1" ] && ARGS+=(--skip-mm-profiling)
-    say "vision on: limit-mm=${LIMIT_MM:-} skip-mm-profiling=${SKIP_MM_PROFILING:-1} chat-template=${CHAT_TEMPLATE:-}"
+    say "vision on: limit-mm=${LIMIT_MM:-} image-tokens=${MM_IMAGE_TOKENS:-8000} video-frames=${VIDEO_NUM_FRAMES:-32} mm-cache-gb=${MM_PROCESSOR_CACHE_GB:-4} skip-mm-profiling=${SKIP_MM_PROFILING:-1} chat-template=${CHAT_TEMPLATE:-}"
 fi
 if [ -n "${EXTRA_ARGS:-}" ]; then
     # shellcheck disable=SC2206
@@ -1251,7 +1632,7 @@ EOF
 if [ "${ABLIT:-0}" = "1" ]; then
     say "ablit: o_proj orthogonalization ON (method=${ABLIT_METHOD:-auto} direction=${ABLIT_DIRECTION:-dealign} layers=${ABLIT_LAYERS:-15-45} alpha=${ABLIT_ALPHA:-3.0})"
 else
-    say "ablit: off — stock o_proj weights"
+    say "runtime ablit: off; checkpoint o_proj unchanged"
 fi
 say "launching: vllm serve ${MODEL_DIR} ${ARGS[*]}"
 exec vllm serve "${MODEL_DIR}" "${ARGS[@]}"
@@ -1309,6 +1690,9 @@ if [ "${LANGUAGE_MODEL_ONLY:-0}" = "1" ]; then
     ARGS+=(--language-model-only)
 else
     [ -n "${LIMIT_MM:-}" ] && ARGS+=(--limit-mm-per-prompt "${LIMIT_MM}")
+    [ -n "${MM_IMAGE_TOKENS:-}" ] && ARGS+=(--mm-processor-kwargs "{\"max_image_tokens\":${MM_IMAGE_TOKENS}}")
+    [ -n "${VIDEO_NUM_FRAMES:-}" ] && ARGS+=(--media-io-kwargs "{\"video\":{\"num_frames\":${VIDEO_NUM_FRAMES}}}")
+    [ -n "${MM_PROCESSOR_CACHE_GB:-}" ] && ARGS+=(--mm-processor-cache-gb "${MM_PROCESSOR_CACHE_GB}")
     [ "${SKIP_MM_PROFILING:-1}" = "1" ] && ARGS+=(--skip-mm-profiling)
 fi
 if [ -n "${EXTRA_ARGS:-}" ]; then
@@ -1324,7 +1708,7 @@ EOF
 if [ "${ABLIT:-0}" = "1" ]; then
     say "ablit: o_proj orthogonalization ON (method=${ABLIT_METHOD:-auto} direction=${ABLIT_DIRECTION:-dealign} layers=${ABLIT_LAYERS:-15-45} alpha=${ABLIT_ALPHA:-3.0})"
 else
-    say "ablit: off — stock o_proj weights"
+    say "runtime ablit: off; checkpoint o_proj unchanged"
 fi
 say "joining TP2 at ${HEAD_IP}:${MASTER_PORT} as rank 1"
 exec vllm serve "${MODEL_DIR}" "${ARGS[@]}"
@@ -1354,8 +1738,14 @@ launch_cluster() {
     scp -q -o BatchMode=yes "$APC_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_hybrid_prefix_hit.py"
     [ -f "$PERGROUP_PATCH_HOST" ] || die "missing $PERGROUP_PATCH_HOST"
     scp -q -o BatchMode=yes "$PERGROUP_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_apc_per_group_retention.py"
+    [ -f "$NOSTORE_PATCH_HOST" ] || die "missing $NOSTORE_PATCH_HOST"
+    scp -q -o BatchMode=yes "$NOSTORE_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_apc_no_store.py"
+    [ -f "$KVCAP_PATCH_HOST" ] || die "missing $KVCAP_PATCH_HOST"
+    scp -q -o BatchMode=yes "$KVCAP_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_kv_capacity_log.py"
     [ -f "$XGRAMMAR_PATCH_HOST" ] || die "missing $XGRAMMAR_PATCH_HOST"
     scp -q -o BatchMode=yes "$XGRAMMAR_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_xgrammar_termination.py"
+    [ -f "$CACHE_RESET_PATCH_HOST" ] || die "missing $CACHE_RESET_PATCH_HOST"
+    scp -q -o BatchMode=yes "$CACHE_RESET_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_cache_reset.py"
     [ -f "$KPOOL_TAIL_PATCH_HOST" ] || die "missing $KPOOL_TAIL_PATCH_HOST"
     scp -q -o BatchMode=yes "$KPOOL_TAIL_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_kpool_tail_slotmap.py"
     [ -f "$SPINWAIT_PATCH_HOST" ] || die "missing $SPINWAIT_PATCH_HOST"
@@ -1364,6 +1754,8 @@ launch_cluster() {
     scp -q -o BatchMode=yes "$ADAPTIVE_K_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_adaptive_k.py"
     [ -f "$DENSE_FP8_PATCH_HOST" ] || die "missing $DENSE_FP8_PATCH_HOST"
     scp -q -o BatchMode=yes "$DENSE_FP8_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_dense_fp8.py"
+    [ -f "$DEFAULT_TOKENS_PATCH_HOST" ] || die "missing $DEFAULT_TOKENS_PATCH_HOST"
+    scp -q -o BatchMode=yes "$DEFAULT_TOKENS_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_default_max_new_tokens.py"
     scp -q -o BatchMode=yes "$EXL3_OVERLAY_HOST" "${WORKER_SSH}:/tmp/glm53-exl3.py"
 
     worker_ssh "rm -rf /tmp/glm53-ablit"
@@ -1388,6 +1780,15 @@ launch_cluster() {
         -e VLLM_CACHE_ROOT=/root/.cache/vllm
         -e "GLM53_SUPPRESS_STOPS_IN_REASONING=$GLM53_SUPPRESS_STOPS_IN_REASONING"
         -e "GLM53_MIXED_PREFILL_CHUNK=$GLM53_MIXED_PREFILL_CHUNK"
+        -e "GLM53_APC_NO_STORE=$GLM53_APC_NO_STORE"
+        -e "GLM53_KV_CAPACITY_LOG=$GLM53_KV_CAPACITY_LOG"
+        -e "GLM53_FAIR_PREFILL_CHUNK=$GLM53_FAIR_PREFILL_CHUNK"
+        -e "GLM53_FAIR_PREFILL_SHARE=$GLM53_FAIR_PREFILL_SHARE"
+        -e "GLM53_FAIR_PREFILL_MAX_INTERVAL_MS=$GLM53_FAIR_PREFILL_MAX_INTERVAL_MS"
+        -e "GLM53_FAIR_PREFILL_MAX_STEP_MS=$GLM53_FAIR_PREFILL_MAX_STEP_MS"
+        -e "GLM53_FAIR_PREFILL_MAX_CHUNKS=$GLM53_FAIR_PREFILL_MAX_CHUNKS"
+        # Cache-only opt-in; independent VLLM_SERVER_DEV_MODE retains precedence.
+        -e "GLM53_EXPOSE_CACHE_RESET=$GLM53_EXPOSE_CACHE_RESET"
         -e "GLM53_DEFAULT_REASONING_EFFORT=${GLM53_DEFAULT_REASONING_EFFORT-}"
         -e "GLM53_INDEXER_WORKSPACE=$GLM53_INDEXER_WORKSPACE"
         -e "GLM53_SPINWAIT_MS=$GLM53_SPINWAIT_MS"
@@ -1407,6 +1808,8 @@ launch_cluster() {
         -e DO_NOT_TRACK=1
         -e "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=$CG_ESTIMATE"
     )
+    log "per-request prefix-cache no-store flag: GLM53_APC_NO_STORE=${GLM53_APC_NO_STORE} (both ranks)"
+    log "boot KV-capacity breakdown log: GLM53_KV_CAPACITY_LOG=${GLM53_KV_CAPACITY_LOG} (both ranks)"
     # Global sparse retention is implemented by the pinned vLLM runtime.  Full
     # attention remains dense; Mamba managers use this value.  Keep this an
     # explicit deployer setting and forward it identically to both ranks.
@@ -1420,12 +1823,6 @@ launch_cluster() {
         nccl_common+=(-e "VLLM_PREFIX_CACHE_RETENTION_INTERVAL_SWA=$GLM53_APC_RETENTION_INTERVAL_SWA")
         log "drafter (SWA) prefix-cache retention interval: ${GLM53_APC_RETENTION_INTERVAL_SWA} (both ranks)"
     fi
-    local worker_nccl="" e quoted_env
-    for e in "${nccl_common[@]}"; do
-        [ "$e" = "-e" ] && continue
-        printf -v quoted_env '%q' "$e"
-        worker_nccl+=" -e $quoted_env"
-    done
 
     local -a head_preload=() worker_preload=""
     if [ "$USE_HOST_NCCL" = "1" ]; then
@@ -1444,6 +1841,7 @@ launch_cluster() {
     fi
 
     local serve_env=""
+    local -a serve_env_names=()
     local v
     for v in SERVED_MODEL_NAME PORT TP NNODES HEAD_IP MASTER_PORT QUANTIZATION \
              MAX_MODEL_LEN GPU_MEM_UTIL MAX_NUM_SEQS MAX_NUM_BATCHED_TOKENS \
@@ -1451,12 +1849,67 @@ launch_cluster() {
              KV_CACHE_DTYPE MTP_TOKENS SPEC_METHOD DFLASH_TOKENS DFLASH_MODEL_DIR \
              DFLASH_DRAFT_TP \
              LANGUAGE_MODEL_ONLY SKIP_MM_PROFILING \
-             LIMIT_MM CHAT_TEMPLATE ENFORCE_EAGER EXL3_FUSED_MOE EXL3_MOE_ROW_TILE EXL3_TEMP_ROWS_FUSED EXL3_FAT_SORTED EXL3_FAT_BATCHED EXL3_FAT_KERNEL EXL3_FAT_GROUPED MODEL_DIR EXTRA_ARGS \
+             MM_IMAGE_TOKENS VIDEO_NUM_FRAMES MM_PROCESSOR_CACHE_GB \
+             LIMIT_MM CHAT_TEMPLATE ENFORCE_EAGER EXL3_FUSED_MOE EXL3_MOE_ROW_TILE EXL3_TEMP_ROWS_FUSED \
+             EXL3_FAT_SORTED EXL3_FAT_BATCHED EXL3_FAT_KERNEL EXL3_FAT_GROUPED \
+             DEFAULT_MAX_NEW_TOKENS MODEL_DIR EXTRA_ARGS \
              ABLIT ABLIT_METHOD ABLIT_DIRECTION ABLIT_LAYERS ABLIT_ALPHA ABLIT_INCLUDE_MTP \
              GLM53_ADAPTIVE_K GLM53_ADAPTIVE_K_SET GLM53_ADAPTIVE_K_ALPHA GLM53_ADAPTIVE_K_MARGIN \
              GLM53_ADAPTIVE_K_MIN_STEPS GLM53_ADAPTIVE_K_SATURATE GLM53_ADAPTIVE_K_HIST GLM53_DENSE_FP8; do
         serve_env+=" -e $v='${!v:-}'"
+        serve_env_names+=("$v")
     done
+
+    # Extra container env for diagnostics (space-separated NAME=VALUE list, e.g.
+    # GLM53_EXTRA_ENV="VLLM_DEBUG_WORKSPACE=1"). Forwarded to both ranks as -e pairs.
+    # A name this launch already forwards — every entry of nccl_common and
+    # serve_env, the per-rank NCCL_*/VLLM_HOST_IP block — is rejected, as are the
+    # launcher's namespaces and conditionally-forwarded knobs: docker takes the
+    # last duplicate -e, so a same-named entry would silently override the knob
+    # and skip its range check. Values: [A-Za-z0-9_./:@,+=-]* only (no spaces,
+    # quotes, globs or shell metacharacters — the worker command line is built as
+    # shell text). Only names are logged; values may carry credentials, so a
+    # rejected entry is reported by position only and is never echoed.
+    if [ -n "${GLM53_EXTRA_ENV:-}" ]; then
+        local _kv _name _value _entry _names="" _owned=" " _idx=0
+        # Read the owned set off the arguments this launch builds, so a knob added
+        # to either list cannot be shadowed here without a second list to keep in sync.
+        for _entry in "${nccl_common[@]}" "${serve_env_names[@]}" \
+                      NCCL_SOCKET_IFNAME GLOO_SOCKET_IFNAME NCCL_IB_HCA \
+                      NCCL_IB_GID_INDEX VLLM_HOST_IP VLLM_API_KEY LD_PRELOAD; do
+            [ "$_entry" = "-e" ] && continue
+            _owned="$_owned ${_entry%%=*} "
+        done
+        set -f
+        for _kv in $GLM53_EXTRA_ENV; do
+            _idx=$((_idx + 1))
+            # The word split above delivers a whitespace-containing value as
+            # fragments, so the raw token and the unvalidated name can both carry
+            # part of a credential: neither is interpolated into a rejection.
+            case "$_kv" in *=*) ;; *) die "GLM53_EXTRA_ENV entry $_idx must be NAME=VALUE";; esac
+            _name="${_kv%%=*}"; _value="${_kv#*=}"
+            [[ "$_name" =~ ^[A-Z_][A-Z0-9_]*$ ]] || die "GLM53_EXTRA_ENV entry $_idx: name must match [A-Z_][A-Z0-9_]*"
+            [[ "$_value" =~ ^[A-Za-z0-9_./:@,+=-]*$ ]] || die "GLM53_EXTRA_ENV: unsafe value for $_name (allowed: A-Z a-z 0-9 _ . / : @ , + = -)"
+            case "$_name" in
+                NCCL_*|HF_*|GLM53_*|EXL3_*|FLASHINFER_*|PATH|PYTHONPATH|VLLM_PREFIX_CACHE_RETENTION_INTERVAL*)
+                    die "GLM53_EXTRA_ENV: $_name is launcher-owned; set it through its own knob";;
+            esac
+            case "$_owned" in
+                *" $_name "*) die "GLM53_EXTRA_ENV: $_name is launcher-owned; set it through its own knob";;
+            esac
+            nccl_common+=(-e "$_kv"); _names="$_names $_name"
+        done
+        set +f
+        log "extra container env (both ranks):${_names}"
+    fi
+
+    local worker_nccl="" e quoted_env
+    for e in "${nccl_common[@]}"; do
+        [ "$e" = "-e" ] && continue
+        printf -v quoted_env '%q' "$e"
+        worker_nccl+=" -e $quoted_env"
+    done
+
     # The worker is headless and serves no API, so do not propagate the API
     # credential into its remote docker command or container environment.
 
@@ -1465,7 +1918,7 @@ launch_cluster() {
         --gpus all --network host --ipc=host --shm-size 32g --stop-timeout 60 \
         --device /dev/infiniband --cap-add IPC_LOCK \
         --ulimit memlock=-1 --ulimit stack=67108864 \
-        -v '$WORKER_CACHE_DIR:/root/.cache/huggingface' \
+        -v '$(_hf_mount)' \
         -v '$WORKER_VLLM_CACHE:/root/.cache/vllm' \
         -v '$WORKER_TRITON_CACHE:/root/.triton/cache' \
         -v '$WORKER_TILELANG_CACHE:/root/.tilelang/cache' \
@@ -1477,11 +1930,15 @@ launch_cluster() {
         -v '/tmp/patch_glm5_drafter_group.py:/opt/glm53/patch_glm5_drafter_group.py:ro' \
         -v '/tmp/patch_hybrid_prefix_hit.py:/opt/glm53/patch_hybrid_prefix_hit.py:ro' \
         -v '/tmp/patch_apc_per_group_retention.py:/opt/glm53/patch_apc_per_group_retention.py:ro' \
+        -v '/tmp/patch_apc_no_store.py:/opt/glm53/patch_apc_no_store.py:ro' \
+        -v '/tmp/patch_kv_capacity_log.py:/opt/glm53/patch_kv_capacity_log.py:ro' \
         -v '/tmp/patch_xgrammar_termination.py:/opt/glm53/patch_xgrammar_termination.py:ro' \
+        -v '/tmp/patch_cache_reset.py:/opt/glm53/patch_cache_reset.py:ro' \
         -v '/tmp/patch_kpool_tail_slotmap.py:/opt/glm53/patch_kpool_tail_slotmap.py:ro' \
         -v '/tmp/patch_spinwait.py:/opt/glm53/patch_spinwait.py:ro' \
         -v '/tmp/patch_adaptive_k.py:/opt/glm53/patch_adaptive_k.py:ro' \
         -v '/tmp/patch_dense_fp8.py:/opt/glm53/patch_dense_fp8.py:ro' \
+        -v '/tmp/patch_default_max_new_tokens.py:/opt/glm53/patch_default_max_new_tokens.py:ro' \
         -v '/tmp/glm53-exl3.py:/opt/glm53/exl3.py:ro' \
         -v '/tmp/glm53-ablit:/opt/glm53/ablit:ro' \
         -v '/tmp/glm53-ablit_runtime.py:/opt/glm53/ablit_runtime.py:ro' \
@@ -1513,11 +1970,15 @@ launch_cluster() {
         -v "$DRAFTER_PATCH_HOST:/opt/glm53/patch_glm5_drafter_group.py:ro" \
         -v "$APC_PATCH_HOST:/opt/glm53/patch_hybrid_prefix_hit.py:ro" \
         -v "$PERGROUP_PATCH_HOST:/opt/glm53/patch_apc_per_group_retention.py:ro" \
+        -v "$NOSTORE_PATCH_HOST:/opt/glm53/patch_apc_no_store.py:ro" \
+        -v "$KVCAP_PATCH_HOST:/opt/glm53/patch_kv_capacity_log.py:ro" \
         -v "$XGRAMMAR_PATCH_HOST:/opt/glm53/patch_xgrammar_termination.py:ro" \
+        -v "$CACHE_RESET_PATCH_HOST:/opt/glm53/patch_cache_reset.py:ro" \
         -v "$KPOOL_TAIL_PATCH_HOST:/opt/glm53/patch_kpool_tail_slotmap.py:ro" \
         -v "$SPINWAIT_PATCH_HOST:/opt/glm53/patch_spinwait.py:ro" \
         -v "$ADAPTIVE_K_PATCH_HOST:/opt/glm53/patch_adaptive_k.py:ro" \
         -v "$DENSE_FP8_PATCH_HOST:/opt/glm53/patch_dense_fp8.py:ro" \
+        -v "$DEFAULT_TOKENS_PATCH_HOST:/opt/glm53/patch_default_max_new_tokens.py:ro" \
         -v "$EXL3_OVERLAY_HOST:/opt/glm53/exl3.py:ro" \
         -v "$SCRIPT_DIR/ablit:/opt/glm53/ablit:ro" \
         -v "$SCRIPT_DIR/overlay/ablit_runtime.py:/opt/glm53/ablit_runtime.py:ro" \
@@ -1536,6 +1997,7 @@ launch_cluster() {
         -e MAX_MODEL_LEN="$MAX_MODEL_LEN" -e GPU_MEM_UTIL="$GPU_MEM_UTIL" \
         -e MAX_NUM_SEQS="$MAX_NUM_SEQS" \
         -e MAX_NUM_BATCHED_TOKENS="$MAX_NUM_BATCHED_TOKENS" \
+        -e DEFAULT_MAX_NEW_TOKENS="$DEFAULT_MAX_NEW_TOKENS" \
         -e LONG_PREFILL_TOKEN_THRESHOLD="${LONG_PREFILL_TOKEN_THRESHOLD:-}" \
         -e KV_CACHE_DTYPE="$KV_CACHE_DTYPE" -e MTP_TOKENS="$MTP_TOKENS" \
         -e SPEC_METHOD="$SPEC_METHOD" \
@@ -1545,6 +2007,9 @@ launch_cluster() {
         -e LANGUAGE_MODEL_ONLY="$LANGUAGE_MODEL_ONLY" \
         -e SKIP_MM_PROFILING="$SKIP_MM_PROFILING" \
         -e LIMIT_MM="$LIMIT_MM" \
+        -e MM_IMAGE_TOKENS="${MM_IMAGE_TOKENS:-}" \
+        -e VIDEO_NUM_FRAMES="${VIDEO_NUM_FRAMES:-}" \
+        -e MM_PROCESSOR_CACHE_GB="${MM_PROCESSOR_CACHE_GB:-}" \
         -e CHAT_TEMPLATE="$CHAT_TEMPLATE" \
         -e ENFORCE_EAGER="$ENFORCE_EAGER" \
         -e EXL3_FUSED_MOE="$EXL3_FUSED_MOE" \
@@ -1589,22 +2054,38 @@ wait_for_health() {
         logpid=""
     }
     trap '_stop_logtail; warn "interrupted — containers keep running ('"'"'./start.sh logs'"'"' / '"'"'./start.sh stop'"'"')"; exit 130' INT
-    docker logs -f --tail 0 "$CONTAINER_HEAD" 2>&1 &
+    # 9>&-: the follower must not inherit the lifecycle lock fd. Bash passes
+    # `exec 9>` descriptors through exec, so a follower that somehow outlives
+    # this shell (SIGKILL, no trap) would keep the flock held.
+    docker logs -f --tail 0 "$CONTAINER_HEAD" 2>&1 9>&- &
     logpid=$!
 
-    local elapsed=0 healthy=0 exited=0 dead_side="" worker_fail=0
+    local elapsed=0 healthy=0 exited=0 dead_side="" worker_fail=0 head_fail=0
     while [ "$elapsed" -lt "$READY_TIMEOUT" ]; do
         if curl -fsS -m 5 "$url" >/dev/null 2>&1; then healthy=1; break; fi
-        if ! docker inspect -f '{{.State.Running}}' "$CONTAINER_HEAD" 2>/dev/null | grep -q true; then
-            log "head container exited during startup"
-            exited=1; dead_side="head"; break
+        # Keep the inspect result out of a grep -q pipeline. With pipefail,
+        # grep can close early and make a running container look dead.
+        # Same 3-strike window as the worker: one transient docker miss must
+        # not abort a multi-minute weight load.
+        if [ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER_HEAD" 2>/dev/null || true)" = "true" ]; then
+            head_fail=0
+        else
+            head_fail=$((head_fail + 1))
+            if [ "$head_fail" -ge 3 ]; then
+                if docker inspect "$CONTAINER_HEAD" >/dev/null 2>&1; then
+                    log "head container not running during startup (3 consecutive checks)"
+                else
+                    log "head container missing during startup (removed by concurrent stop/restart?)"
+                fi
+                exited=1; dead_side="head"; break
+            fi
         fi
         # A dead worker rank can never make the head healthy — fail fast with
         # the log dump instead of polling for the full READY_TIMEOUT (issue
         # #22, item 4). Transient ssh/docker hiccups are tolerated; only
         # three consecutive non-running answers (~30 s) count as a dead
         # worker.
-        if worker_ssh "docker inspect -f '{{.State.Running}}' '$CONTAINER_WORKER' 2>/dev/null" | grep -q true; then
+        if [ "$(worker_ssh "docker inspect -f '{{.State.Running}}' '$CONTAINER_WORKER' 2>/dev/null" || true)" = "true" ]; then
             worker_fail=0
         else
             worker_fail=$((worker_fail + 1))
@@ -1664,9 +2145,11 @@ on_ready() {
     local spec="MTP k=${MTP_TOKENS}"
     [ "$SPEC_METHOD" = "dflash" ] && spec="DFlash2 k=${DFLASH_TOKENS} (${DFLASH_MODEL})"
     [ "$SPEC_METHOD" = "none" ] && spec=off
-    local ablit="off (stock weights)"
+    local mt_line="mt_default=off (stock model/server limits)"
+    [ -n "${DEFAULT_MAX_NEW_TOKENS:-}" ] && mt_line="mt_default=${DEFAULT_MAX_NEW_TOKENS}"
+    local ablit="off (checkpoint weights unchanged)"
     [ "$ABLIT" = "1" ] && ablit="ON method=${ABLIT_METHOD} direction=${ABLIT_DIRECTION} layers=${ABLIT_LAYERS} alpha=${ABLIT_ALPHA}"
-    log "  features   : tools=glm47+auto, reasoning=glm45, spec=${spec}, vision=${vision}, ablit=${ablit}"
+    log "  features   : tools=glm47+auto, reasoning=glm45, spec=${spec}, vision=${vision}, ${mt_line}, ablit=${ablit}"
     local auth_line="none (VLLM_API_KEY empty)"
     if [ -n "${VLLM_API_KEY:-}" ]; then
         auth_line="bearer token set (VLLM_API_KEY) — send Authorization: Bearer <key> on /v1 requests"
@@ -1690,7 +2173,7 @@ on_ready() {
 }
 
 # ------------------------------- start -------------------------------------
-start() {
+start_unlocked() {
     preflight
     ensure_image
     download_weights
@@ -1707,12 +2190,13 @@ start() {
     log "model load path (in-container): ${MODEL_DIR}"
     log "config: image=${IMAGE} tp=${TP} nnodes=${NNODES} quant=${QUANTIZATION} spec=${SPEC_METHOD} mtp=${MTP_TOKENS} dflash_k=${DFLASH_TOKENS} max-len=${MAX_MODEL_LEN} gpu-util=${GPU_MEM_UTIL} kv=${KV_CACHE_DTYPE} lm-only=${LANGUAGE_MODEL_ONLY} port=${PORT}"
     log "exl3: fat_kernel=${EXL3_FAT_KERNEL} fat_grouped=${EXL3_FAT_GROUPED} temp_rows_fused=${EXL3_TEMP_ROWS_FUSED} mnbt=${MAX_NUM_BATCHED_TOKENS} max_num_seqs=${MAX_NUM_SEQS} draft_tp=${DFLASH_DRAFT_TP}"
+    log "mixed-prefill: policy=${GLM53_MIXED_PREFILL_CHUNK} fair_chunk=${GLM53_FAIR_PREFILL_CHUNK} share=${GLM53_FAIR_PREFILL_SHARE} interval_ms=${GLM53_FAIR_PREFILL_MAX_INTERVAL_MS} max_step_ms=${GLM53_FAIR_PREFILL_MAX_STEP_MS} max_chunks=${GLM53_FAIR_PREFILL_MAX_CHUNKS} long_prefill=${LONG_PREFILL_TOKEN_THRESHOLD:-}"
 
     launch_cluster
     if wait_for_health; then
         post_ready_warmup
         on_ready
-        return
+        return 0
     fi
     collect_failure_logs
     echo "---- last 60 lines of head log ($LOGDIR/head.log) ----"
@@ -1722,14 +2206,29 @@ start() {
     die "server did not become healthy — full logs in $LOGDIR/"
 }
 
-# ------------------------------- stop --------------------------------------
-stop() {
+start() {
+    with_cluster_lock
+    start_unlocked
+}
+
+stop_containers() {
     log "stopping head container ..."
     docker rm -f "$CONTAINER_HEAD" >/dev/null 2>&1 || log "  (no head container was running)"
     log "stopping worker container on ${WORKER_SSH} ..."
     worker_ssh "docker rm -f '$CONTAINER_WORKER'" >/dev/null 2>&1 \
         || log "  (no worker container was running)"
+    if [ "${NFS_SHARE:-0}" = "1" ]; then
+        log "removing the worker NFS volume (the exporter stays up) ..."
+        nfs_unmount_workers
+    fi
     log "stopped."
+}
+
+# ------------------------------- stop --------------------------------------
+stop() {
+    with_cluster_lock_for_stop
+    stop_containers
+    rm -f "$CLUSTER_LOCK_PID" || true
 }
 
 # ------------------------------ status -------------------------------------
@@ -1779,9 +2278,15 @@ main() {
         start)    shift || true; start ;;
         download) download_only ;;
         stop)     stop ;;
-        restart)  stop; start ;;
+        restart)
+            with_cluster_lock
+            stop_containers
+            start_unlocked
+            ;;
         status)   status ;;
         logs)     shift || true; logs "$@" ;;
+        share)    [ "${NFS_SHARE:-0}" = "1" ] || die "NFS_SHARE=0 in .env — set NFS_SHARE=1 to share the head HF cache over NFS"
+                  nfs_share_weights ;;
         -h|--help|help) usage ;;
         *) usage; exit 1 ;;
     esac
