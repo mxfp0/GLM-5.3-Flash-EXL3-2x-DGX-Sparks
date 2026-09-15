@@ -644,8 +644,8 @@ preflight() {
         || die "HEAD_IP=${HEAD_IP} is not assigned on this host — set it in .env"
 
     log "checking worker ${WORKER_SSH} ..."
-    worker_ssh true 2>/dev/null \
-        || die "cannot ssh (key-based) to ${WORKER_SSH} — set up passwordless ssh first"
+    worker_ssh true \
+        || die "cannot ssh to ${WORKER_SSH} — see SSH error above; check network connectivity and key-based authentication"
     worker_ssh "docker info >/dev/null 2>&1" \
         || die "worker cannot talk to its docker daemon (docker group?)"
     worker_ssh "nvidia-smi -L 2>/dev/null | grep -q GB10" \
